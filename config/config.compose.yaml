@@ -1,0 +1,159 @@
+# EdgeFlow configuration for docker compose: the shipped config.yaml with the service
+# registry enabled and pointed at the "postgres" service.
+# Unknown keys are rejected so that typos are caught at startup.
+
+application:
+  name: edgeflow
+  environment: development   # development | staging | production
+  log_level: info            # trace | debug | info | warn | error | critical | off
+
+server:
+  host: 0.0.0.0              # address to bind (IP literal or resolvable name)
+  port: 8080                 # 1..65535
+  request_timeout_ms: 5000   # 10..600000; time allowed to receive a request / write a response
+  keep_alive_timeout_ms: 10000   # 10..600000; idle time before a keep-alive connection is closed
+  max_request_body_bytes: 1048576   # 0..67108864 (default 1 MiB); larger bodies get 413
+  max_header_bytes: 8192     # 1024..65536; larger headers get 431
+  max_connections: 1024      # 1..100000; connections beyond this are closed immediately
+  worker_threads: 2          # 1..64; threads running the asynchronous I/O loop
+
+database:
+  # Phase 3 service registry. PostgreSQL is the persistent source of service metadata.
+  # Enabled for docker compose: startup connects, applies schema migrations, and fails if
+  # the database is unreachable.
+  enabled: true
+  host: postgres             # PostgreSQL address (the Compose service name)
+  port: 5432                 # 1..65535
+  name: edgeflow             # database name
+  user: edgeflow
+  password_env: EDGEFLOW_DB_PASSWORD   # NAME of the environment variable holding the password; never put the password here
+  pool_size: 4               # 1..64 connections; each in-flight registry request holds one
+  connect_timeout_seconds: 5 # 1..60
+
+health_check:
+  # Enabled for docker compose: registered instances are probed with HTTP GET /health.
+  # Short intervals so a failure or recovery is visible within seconds.
+  enabled: true
+  type: http                  # tcp | http
+  interval_ms: 2000          # 100..3600000; pause between one probe of an instance and the next
+  timeout_ms: 1000           # 10..60000; bound for one whole probe; must not exceed interval_ms
+  http_path: /health         # request path for type http; a 2xx response is healthy
+  failure_threshold: 2       # 1..100; consecutive failures before a healthy instance is marked unhealthy
+  success_threshold: 2       # 1..100; consecutive successes before an unhealthy instance is marked healthy
+  refresh_interval_ms: 2000   # 100..3600000; how often the registry is re-read for new/removed/disabled instances
+  max_concurrent_checks: 32  # 1..1024
+
+routing:
+  # Phase 5: how an instance is chosen among the routable (active AND healthy) ones.
+  # Try the decision with: curl 'http://127.0.0.1:8080/services/<service>/route?key=<k>'
+  strategy: round_robin      # round_robin | least_connections | weighted | consistent_hashing
+  # Phase 10: keep the routable-instance list of a service for this long instead of reading
+  # PostgreSQL on every request (0 = off). A health or registry change reaches routing at most this
+  # late; an expired snapshot is never served while the database is down. Not allowed with
+  # least_connections (it needs live counts). 0..60000.
+  snapshot_ttl_ms: 250
+
+proxy:
+  # Phase 6 reverse proxy, enabled for docker compose:
+  #   curl http://127.0.0.1:8080/proxy/<service>/<path>
+  # forwards to a healthy registered instance of <service> (prefix stripped, query kept).
+  enabled: true
+  connect_timeout_ms: 2000   # 10..60000; resolving + connecting to a backend; exceeding it answers 504
+  upstream_timeout_ms: 5000  # 10..600000; whole exchange (connect + request + response); exceeding it answers 504
+  io_threads: 2              # 1..64; threads running upstream I/O (separate from server.worker_threads)
+  max_idle_connections: 32   # 0..1024; idle keep-alive connections kept per backend; 0 disables connection reuse
+  idle_timeout_ms: 30000     # 10..3600000; an idle pooled connection older than this is closed, not reused
+  max_response_bytes: 16777216   # 1024..268435456 (default 16 MiB); a larger backend response answers 502
+  # Phase 10: whether every proxied request writes +1/-1 to service_instances.connection_count in
+  # PostgreSQL. Only the least_connections strategy reads that number. always = as before;
+  # auto = only when routing.strategy is least_connections (measured: 2.45x throughput on the
+  # other strategies); never = never.
+  connection_counting: auto   # always | auto | never
+
+reliability:
+  # Phase 7 reliability engineering around the reverse proxy. Needs proxy.enabled.
+  # Enabled for docker compose with short delays so a failure and a recovery are visible in seconds.
+  enabled: true
+  timeout:
+    # Bound for the WHOLE proxied request: every attempt and every backoff pause. One attempt
+    # gets at most min(proxy.upstream_timeout_ms, what is left of this budget).
+    total_timeout_ms: 12000  # 10..3600000
+  retry:
+    enabled: true
+    max_attempts: 3          # 1..10; TOTAL attempts including the first (1 = never retry)
+    base_delay_ms: 100       # 1..60000; pause before the first retry; doubles for each further one
+    max_delay_ms: 2000       # 1..600000; cap of the pause; >= base_delay_ms
+    jitter_percent: 20       # 0..100; each pause is shortened by up to this percent at random
+    # A backend answer with one of these statuses counts as a failed attempt; every other
+    # status (including 4xx and other 5xx) is the application's answer and is forwarded.
+    retryable_statuses: [502, 503, 504]   # each 400..599; [] = never retry on a status
+    # Methods retried after the backend MAY have processed the request (timeout, reset,
+    # retryable status). A request that provably never reached a backend (connection refused,
+    # name not resolved, connect timeout) is retried whatever its method.
+    retryable_methods: [GET, HEAD, OPTIONS]
+  circuit_breaker:
+    # One circuit per backend instance: CLOSED -> OPEN -> HALF-OPEN -> CLOSED.
+    enabled: true
+    failure_threshold: 3       # 1..1000; consecutive failed requests that open the circuit
+    recovery_timeout_ms: 6000  # 10..3600000; time open before probe request(s) are let through
+    half_open_max_requests: 1  # 1..100; probes allowed in flight; that many successes close it
+
+redis:
+  # Phase 8: the Redis container of docker-compose.yml.
+  enabled: true
+  host: redis
+  port: 6379
+  password_env: ""
+  key_prefix: edgeflow
+  # Short: while Redis is unreachable (not refusing), one request per retry_interval_ms pays this
+  # much before the gateway goes on without Redis.
+  connect_timeout_ms: 250
+  command_timeout_ms: 250
+  pool_size: 4
+  io_threads: 1
+  retry_interval_ms: 1000
+
+cache:
+  # Short lifetimes so expiry is visible in seconds.
+  enabled: true
+  default_ttl_seconds: 10
+  max_ttl_seconds: 300
+  max_entry_bytes: 1048576
+  cacheable_statuses: [200]
+
+rate_limit:
+  # Small buckets so the limits are visible in a demonstration.
+  enabled: true
+  on_redis_failure: allow
+  ip:
+    enabled: true
+    capacity: 30
+    refill_per_second: 10
+  api_key:
+    enabled: true
+    header: X-API-Key
+    capacity: 10
+    refill_per_second: 2
+  service:
+    enabled: true
+    capacity: 200
+    refill_per_second: 100
+    overrides:
+      strict:
+        capacity: 5
+        refill_per_second: 1
+
+metrics:
+  # Phase 9: GET /metrics on the same port (Prometheus text format).
+  enabled: true
+  path: /metrics
+  window_seconds: 10
+
+admin:
+  # Phase 10: to require 'Authorization: Bearer <token>' on /services, put the NAME of an environment
+  # variable here and set it in docker-compose.yml (the gateway refuses to start if it is empty).
+  # Left off here so the demonstration commands stay short; do not expose an unprotected gateway.
+  token_env: ""
+
+shutdown:
+  grace_period_seconds: 5    # 0..300; in-flight requests may finish within this time

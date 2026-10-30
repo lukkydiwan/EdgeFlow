@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.build_type }} (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    # A real PostgreSQL so the registry persistence tests run instead of being skipped.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: edgeflow
+          POSTGRES_PASSWORD: ci_only_password
+          POSTGRES_DB: edgeflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U edgeflow -d edgeflow"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      # A real Redis so the cache and rate limiter tests run instead of being skipped.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { build_type: Debug, compiler: gcc, cc: gcc, cxx: g++ }
+          - { build_type: Release, compiler: gcc, cc: gcc, cxx: g++ }
+          - { build_type: Debug, compiler: clang, cc: clang, cxx: clang++ }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake clang libboost-dev libpq-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DEDGEFLOW_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          EDGEFLOW_TEST_DB_HOST: 127.0.0.1
+          EDGEFLOW_TEST_DB_PORT: "5432"
+          EDGEFLOW_TEST_DB_NAME: edgeflow
+          EDGEFLOW_TEST_DB_USER: edgeflow
+          EDGEFLOW_TEST_DB_PASSWORD: ci_only_password
+          EDGEFLOW_TEST_REDIS_HOST: 127.0.0.1
+          EDGEFLOW_TEST_REDIS_PORT: "6379"
+        run: ctest --test-dir build --output-on-failure
