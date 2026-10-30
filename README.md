@@ -553,5 +553,3 @@ Full scope and exit conditions: [Phases.md](Phases.md). Progress log: [summary.m
 ## Repository
 
 <https://github.com/iamankoo/EdgeFlow>
-#   T a s k F l o w  
- 
